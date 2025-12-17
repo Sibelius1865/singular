@@ -60,14 +60,21 @@ def ir_to_pyg(ir: GraphIR) -> Data:
 # Semantic path checking
 # =========================
 
-def has_semantic_path(ir: GraphIR) -> bool:
+def _ir_to_nx(ir: GraphIR) -> nx.DiGraph:
     """
-    Check if there exists at least one INPUT -> OUTPUT path
+    Convert GraphIR to NetworkX DiGraph
     """
     g = nx.DiGraph()
     g.add_nodes_from(range(ir.num_nodes))
     g.add_edges_from(ir.edge_index.t().tolist())
+    return g
 
+
+def has_semantic_path(ir: GraphIR) -> bool:
+    """
+    Check if there exists at least one INPUT -> OUTPUT path
+    """
+    g = _ir_to_nx(ir)
     inputs = (ir.node_types == NodeType.INPUT).nonzero(as_tuple=True)[0]
     outputs = (ir.node_types == NodeType.OUTPUT).nonzero(as_tuple=True)[0]
 
@@ -79,20 +86,118 @@ def has_semantic_path(ir: GraphIR) -> bool:
     return False
 
 
+def semantic_paths(ir: GraphIR) -> List[List[int]]:
+    """
+    Get all simple paths from INPUT nodes to OUTPUT nodes
+    Returns list of paths (each path is a list of node indices)
+    """
+    g = _ir_to_nx(ir)
+    inputs = (ir.node_types == NodeType.INPUT).nonzero(as_tuple=True)[0].tolist()
+    outputs = (ir.node_types == NodeType.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+
+    all_paths = []
+    for i in inputs:
+        for o in outputs:
+            try:
+                paths = list(nx.all_simple_paths(g, i, o))
+                all_paths.extend(paths)
+            except nx.NetworkXNoPath:
+                continue
+
+    return all_paths
+
+
+def count_compute_in_path(path: List[int], ir: GraphIR) -> int:
+    """
+    Count COMPUTE nodes in a path
+    """
+    return sum(1 for n in path if ir.node_types[n] == NodeType.COMPUTE)
+
+
+def get_node_degrees(ir: GraphIR) -> tuple:
+    """
+    Get in-degree and out-degree for each node
+    Returns (in_degrees, out_degrees) as dicts
+    """
+    g = _ir_to_nx(ir)
+    in_degrees = dict(g.in_degree())
+    out_degrees = dict(g.out_degree())
+    return in_degrees, out_degrees
+
+
+def count_dead_compute(ir: GraphIR) -> int:
+    """
+    Count COMPUTE nodes that cannot reach any OUTPUT
+    """
+    g = _ir_to_nx(ir)
+    outputs = (ir.node_types == NodeType.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+    
+    dead_count = 0
+    for node_id in range(ir.num_nodes):
+        if ir.node_types[node_id] == NodeType.COMPUTE:
+            can_reach_output = any(
+                nx.has_path(g, node_id, o) for o in outputs
+            )
+            if not can_reach_output:
+                dead_count += 1
+    
+    return dead_count
+
+
 # =========================
-# Fitness function (toy)
+# Semantic fitness function
 # =========================
 
 def fitness(ir: GraphIR) -> float:
     """
-    Simple fitness:
-    - reward dense connectivity
-    - penalize too many nodes
+    Semantic fitness function that evaluates:
+    (A) Number of semantic paths (diversity)
+    (B) Average compute depth per path
+    (C) Branch/merge structure (nodes with indegree>=2 or outdegree>=2)
+    (D) Dead compute penalty (COMPUTE nodes that don't reach OUTPUT)
+    (E) Regularization (size penalty)
     """
-    num_nodes = ir.num_nodes
-    num_edges = ir.edge_index.size(1)
-
-    return num_edges - 0.1 * num_nodes
+    paths = semantic_paths(ir)
+    
+    if not paths:
+        return -1e9  # Insurance (should not happen with semantic_mutate)
+    
+    # (A) Path count score (diversity)
+    # Cap at reasonable number to avoid explosion
+    # Use log scale for very large path counts to prevent dominance
+    path_count = len(paths)
+    if path_count <= 20:
+        path_score = path_count
+    else:
+        # Logarithmic scaling for paths > 20
+        path_score = 20 + 2 * (path_count - 20) ** 0.5
+    
+    # (B) Average compute depth per path
+    total_compute_in_paths = sum(count_compute_in_path(p, ir) for p in paths)
+    depth_score = total_compute_in_paths / len(paths)
+    
+    # (C) Branch/merge structure score
+    in_degrees, out_degrees = get_node_degrees(ir)
+    branch_score = sum(
+        1 for n in range(ir.num_nodes)
+        if ir.node_types[n] == NodeType.COMPUTE
+        and (in_degrees.get(n, 0) >= 2 or out_degrees.get(n, 0) >= 2)
+    )
+    
+    # (D) Dead compute penalty
+    dead_nodes = count_dead_compute(ir)
+    
+    # (E) Size regularization
+    size_penalty = 0.01 * ir.num_nodes + 0.005 * ir.edge_index.size(1)
+    
+    # Weighted combination
+    return (
+        1.0 * path_score +
+        0.5 * depth_score +
+        0.3 * branch_score -
+        0.2 * dead_nodes -
+        size_penalty
+    )
 
 
 # =========================
@@ -208,10 +313,13 @@ def evolve(
 
         elites = [ir for _, ir in scored[: int(len(scored) * elite_ratio)]]
 
+        best_ir = scored[0][1]
+        paths = semantic_paths(best_ir)
         print(
             f"Gen {gen}: best fitness = {scored[0][0]:.2f}, "
-            f"nodes = {scored[0][1].num_nodes}, "
-            f"edges = {scored[0][1].edge_index.size(1)}"
+            f"nodes = {best_ir.num_nodes}, "
+            f"edges = {best_ir.edge_index.size(1)}, "
+            f"semantic_paths = {len(paths)}"
         )
 
         # Reproduce
@@ -276,9 +384,15 @@ def main():
 
     # Select best individual by fitness
     best_ir = max(evolved, key=fitness)
+    best_fitness = fitness(best_ir)
 
-    # Visualize best graph
-    visualize_graph(best_ir, title="Best Graph")
+    # Visualize best graph with fitness and path information
+    visualize_graph(
+        best_ir,
+        title="Best Graph (Semantic Evolution)",
+        fitness_value=best_fitness,
+        show_paths=True
+    )
 
     # Convert best individual to PyG Data
     pyg_data = ir_to_pyg(best_ir)
