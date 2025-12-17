@@ -4,8 +4,14 @@ from typing import List, Dict
 
 import torch
 from torch_geometric.data import Data
+import networkx as nx
 
-from visualize import visualize_graph
+try:
+    from .node_type import NodeType
+    from .visualize import visualize_graph
+except ImportError:
+    from node_type import NodeType
+    from visualize import visualize_graph
 
 
 # =========================
@@ -20,10 +26,12 @@ class GraphIR:
     def __init__(
         self,
         node_features: torch.Tensor,  # [N, F]
+        node_types: torch.Tensor,     # [N]  (NodeType)
         edge_index: torch.Tensor,      # [2, E]
         edge_attr: torch.Tensor = None # [E, A]
     ):
         self.node_features = node_features
+        self.node_types = node_types
         self.edge_index = edge_index
         self.edge_attr = edge_attr
 
@@ -43,8 +51,32 @@ def ir_to_pyg(ir: GraphIR) -> Data:
     return Data(
         x=ir.node_features,
         edge_index=ir.edge_index,
-        edge_attr=ir.edge_attr
+        edge_attr=ir.edge_attr,
+        node_type=ir.node_types  # include node types
     )
+
+
+# =========================
+# Semantic path checking
+# =========================
+
+def has_semantic_path(ir: GraphIR) -> bool:
+    """
+    Check if there exists at least one INPUT -> OUTPUT path
+    """
+    g = nx.DiGraph()
+    g.add_nodes_from(range(ir.num_nodes))
+    g.add_edges_from(ir.edge_index.t().tolist())
+
+    inputs = (ir.node_types == NodeType.INPUT).nonzero(as_tuple=True)[0]
+    outputs = (ir.node_types == NodeType.OUTPUT).nonzero(as_tuple=True)[0]
+
+    for i in inputs.tolist():
+        for o in outputs.tolist():
+            if nx.has_path(g, i, o):
+                return True
+
+    return False
 
 
 # =========================
@@ -64,46 +96,99 @@ def fitness(ir: GraphIR) -> float:
 
 
 # =========================
-# Mutation operators
+# Semantic-preserving mutation operators
 # =========================
 
-def mutate_add_edge(ir: GraphIR) -> GraphIR:
+def mutate_insert_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     """
-    Randomly add an edge
+    Insert a COMPUTE node in the middle of an existing edge
+    A -> B  =>  A -> C -> B
     """
+    if ir.edge_index.size(1) == 0:
+        return ir
+
     new_ir = copy.deepcopy(ir)
 
-    src = random.randint(0, new_ir.num_nodes - 1)
-    dst = random.randint(0, new_ir.num_nodes - 1)
+    # pick an existing edge
+    idx = random.randint(0, new_ir.edge_index.size(1) - 1)
+    src, dst = new_ir.edge_index[:, idx].tolist()
 
-    new_edge = torch.tensor([[src], [dst]], dtype=torch.long)
-    new_ir.edge_index = torch.cat([new_ir.edge_index, new_edge], dim=1)
+    # new compute node
+    new_node_id = new_ir.num_nodes
 
-    return new_ir
-
-
-def mutate_add_node(ir: GraphIR, feature_dim: int) -> GraphIR:
-    """
-    Add a new node with random features
-    """
-    new_ir = copy.deepcopy(ir)
-
-    new_feature = torch.randn(1, feature_dim)
     new_ir.node_features = torch.cat(
-        [new_ir.node_features, new_feature], dim=0
+        [new_ir.node_features, torch.randn(1, feature_dim)], dim=0
+    )
+    new_ir.node_types = torch.cat(
+        [new_ir.node_types, torch.tensor([NodeType.COMPUTE])], dim=0
+    )
+
+    # remove old edge
+    mask = torch.ones(new_ir.edge_index.size(1), dtype=torch.bool)
+    mask[idx] = False
+    new_ir.edge_index = new_ir.edge_index[:, mask]
+
+    # add new edges
+    new_edges = torch.tensor(
+        [[src, new_node_id], [new_node_id, dst]],
+        dtype=torch.long
+    ).t()
+
+    new_ir.edge_index = torch.cat(
+        [new_ir.edge_index, new_edges], dim=1
     )
 
     return new_ir
 
 
-def mutate(ir: GraphIR, feature_dim: int) -> GraphIR:
+def mutate_parallel_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     """
-    Choose a mutation randomly
+    Add a parallel COMPUTE path
+    A -> B  =>  A -> C -> B (parallel to A -> B)
     """
-    if random.random() < 0.5:
-        return mutate_add_edge(ir)
-    else:
-        return mutate_add_node(ir, feature_dim)
+    if ir.edge_index.size(1) == 0:
+        return ir
+
+    new_ir = copy.deepcopy(ir)
+
+    idx = random.randint(0, new_ir.edge_index.size(1) - 1)
+    src, dst = new_ir.edge_index[:, idx].tolist()
+
+    new_node_id = new_ir.num_nodes
+
+    new_ir.node_features = torch.cat(
+        [new_ir.node_features, torch.randn(1, feature_dim)], dim=0
+    )
+    new_ir.node_types = torch.cat(
+        [new_ir.node_types, torch.tensor([NodeType.COMPUTE])], dim=0
+    )
+
+    new_edges = torch.tensor(
+        [[src, new_node_id], [new_node_id, dst]],
+        dtype=torch.long
+    ).t()
+
+    new_ir.edge_index = torch.cat(
+        [new_ir.edge_index, new_edges], dim=1
+    )
+
+    return new_ir
+
+
+def semantic_mutate(ir: GraphIR, feature_dim: int) -> GraphIR:
+    """
+    Semantic-preserving mutation with retry mechanism
+    """
+    for _ in range(5):  # safety retry
+        if random.random() < 0.5:
+            candidate = mutate_insert_compute(ir, feature_dim)
+        else:
+            candidate = mutate_parallel_compute(ir, feature_dim)
+
+        if has_semantic_path(candidate):
+            return candidate
+
+    return ir  # fallback (no-op)
 
 
 # =========================
@@ -133,7 +218,7 @@ def evolve(
         new_population = elites.copy()
         while len(new_population) < len(population):
             parent = random.choice(elites)
-            child = mutate(parent, feature_dim)
+            child = semantic_mutate(parent, feature_dim)
             new_population.append(child)
 
         population = new_population
@@ -145,19 +230,24 @@ def evolve(
 # Initialization
 # =========================
 
-def random_graph_ir(
-    num_nodes: int,
-    feature_dim: int,
-    num_edges: int
-) -> GraphIR:
+def initial_graph(feature_dim: int) -> GraphIR:
+    """
+    Create an initial graph with semantic meaning:
+    INPUT -> COMPUTE -> OUTPUT
+    """
+    node_features = torch.randn(3, feature_dim)
+    node_types = torch.tensor([
+        NodeType.INPUT,
+        NodeType.COMPUTE,
+        NodeType.OUTPUT
+    ])
 
-    node_features = torch.randn(num_nodes, feature_dim)
+    edge_index = torch.tensor([
+        [0, 1],
+        [1, 2]
+    ], dtype=torch.long).t()
 
-    edge_index = torch.randint(
-        0, num_nodes, (2, num_edges), dtype=torch.long
-    )
-
-    return GraphIR(node_features, edge_index)
+    return GraphIR(node_features, node_types, edge_index)
 
 
 # =========================
@@ -173,11 +263,7 @@ def main():
 
     # Initialize population
     population = [
-        random_graph_ir(
-            num_nodes=4,
-            feature_dim=feature_dim,
-            num_edges=3
-        )
+        initial_graph(feature_dim)
         for _ in range(population_size)
     ]
 
