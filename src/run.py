@@ -15,6 +15,20 @@ except ImportError:
 
 
 # =========================
+# Operation definitions
+# =========================
+
+OPS = {
+    "id": lambda x: x,
+    "add1": lambda x: x + 1,
+    "mul2": lambda x: x * 2,
+    "square": lambda x: x * x,
+}
+
+OP_NAMES = list(OPS.keys())
+
+
+# =========================
 # Graph IR definition
 # =========================
 
@@ -28,16 +42,28 @@ class GraphIR:
         node_features: torch.Tensor,  # [N, F]
         node_types: torch.Tensor,     # [N]  (NodeType)
         edge_index: torch.Tensor,      # [2, E]
-        edge_attr: torch.Tensor = None # [E, A]
+        edge_attr: torch.Tensor = None, # [E, A]
+        node_ops: Dict[int, str] = None  # {node_id: op_name} for COMPUTE nodes
     ):
         self.node_features = node_features
         self.node_types = node_types
         self.edge_index = edge_index
         self.edge_attr = edge_attr
+        self.node_ops = node_ops if node_ops is not None else {}
 
     @property
     def num_nodes(self):
         return self.node_features.size(0)
+    
+    def copy(self):
+        """Create a deep copy of the GraphIR"""
+        return GraphIR(
+            node_features=self.node_features.clone(),
+            node_types=self.node_types.clone(),
+            edge_index=self.edge_index.clone(),
+            edge_attr=self.edge_attr.clone() if self.edge_attr is not None else None,
+            node_ops=self.node_ops.copy()
+        )
 
 
 # =========================
@@ -54,6 +80,90 @@ def ir_to_pyg(ir: GraphIR) -> Data:
         edge_attr=ir.edge_attr,
         node_type=ir.node_types  # include node types
     )
+
+
+# =========================
+# Graph execution
+# =========================
+
+def execute_graph(ir: GraphIR, input_value: float) -> float:
+    """
+    Execute GraphIR as a pure function.
+    
+    Args:
+        ir: GraphIR to execute
+        input_value: Input value for INPUT nodes
+    
+    Returns:
+        Output value from OUTPUT node
+    
+    Raises:
+        ValueError: If graph structure is invalid
+    """
+    g = _ir_to_nx(ir)
+    env = {}
+    
+    # Topological sort to ensure dependencies are computed first
+    try:
+        order = list(nx.topological_sort(g))
+    except nx.NetworkXError:
+        raise ValueError("Graph contains cycles, cannot execute")
+    
+    for node in order:
+        ntype = ir.node_types[node].item()
+        
+        if ntype == NodeType.INPUT:
+            env[node] = input_value
+        
+        elif ntype == NodeType.COMPUTE:
+            preds = list(g.predecessors(node))
+            if len(preds) == 0:
+                raise ValueError(f"COMPUTE node {node} has no inputs")
+            elif len(preds) == 1:
+                x = env[preds[0]]
+            else:
+                # Multiple inputs: use the first one (simple strategy for unary ops)
+                # In future, could implement merging strategies (sum, max, etc.)
+                # for binary/multi-ary operations
+                x = env[preds[0]]
+            
+            if node not in ir.node_ops:
+                raise ValueError(
+                    f"COMPUTE node {node} has no operation assigned"
+                )
+            
+            op_name = ir.node_ops[node]
+            if op_name not in OPS:
+                raise ValueError(f"Unknown operation: {op_name}")
+            
+            env[node] = OPS[op_name](x)
+        
+        elif ntype == NodeType.OUTPUT:
+            preds = list(g.predecessors(node))
+            if len(preds) == 0:
+                raise ValueError(f"OUTPUT node {node} has no inputs")
+            elif len(preds) == 1:
+                env[node] = env[preds[0]]
+            else:
+                # Multiple inputs: use the first one (simple strategy)
+                # In future, could implement merging strategies (sum, max, etc.)
+                env[node] = env[preds[0]]
+        
+        else:
+            raise ValueError(f"Unknown node type: {ntype}")
+    
+    # Find OUTPUT node and return its value
+    output_nodes = [
+        n for n in range(ir.num_nodes)
+        if ir.node_types[n].item() == NodeType.OUTPUT
+    ]
+    
+    if len(output_nodes) != 1:
+        raise ValueError(
+            f"Graph must have exactly one OUTPUT node (got {len(output_nodes)})"
+        )
+    
+    return env[output_nodes[0]]
 
 
 # =========================
@@ -212,7 +322,7 @@ def mutate_insert_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     if ir.edge_index.size(1) == 0:
         return ir
 
-    new_ir = copy.deepcopy(ir)
+    new_ir = ir.copy()
 
     # pick an existing edge
     idx = random.randint(0, new_ir.edge_index.size(1) - 1)
@@ -227,6 +337,9 @@ def mutate_insert_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     new_ir.node_types = torch.cat(
         [new_ir.node_types, torch.tensor([NodeType.COMPUTE])], dim=0
     )
+    
+    # Assign random operation to new COMPUTE node
+    new_ir.node_ops[new_node_id] = random.choice(OP_NAMES)
 
     # remove old edge
     mask = torch.ones(new_ir.edge_index.size(1), dtype=torch.bool)
@@ -254,7 +367,7 @@ def mutate_parallel_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     if ir.edge_index.size(1) == 0:
         return ir
 
-    new_ir = copy.deepcopy(ir)
+    new_ir = ir.copy()
 
     idx = random.randint(0, new_ir.edge_index.size(1) - 1)
     src, dst = new_ir.edge_index[:, idx].tolist()
@@ -267,6 +380,9 @@ def mutate_parallel_compute(ir: GraphIR, feature_dim: int) -> GraphIR:
     new_ir.node_types = torch.cat(
         [new_ir.node_types, torch.tensor([NodeType.COMPUTE])], dim=0
     )
+    
+    # Assign random operation to new COMPUTE node
+    new_ir.node_ops[new_node_id] = random.choice(OP_NAMES)
 
     new_edges = torch.tensor(
         [[src, new_node_id], [new_node_id, dst]],
@@ -293,7 +409,7 @@ def semantic_mutate(ir: GraphIR, feature_dim: int) -> GraphIR:
         if has_semantic_path(candidate):
             return candidate
 
-    return ir  # fallback (no-op)
+    return ir.copy()  # fallback (no-op)
 
 
 # =========================
@@ -354,8 +470,11 @@ def initial_graph(feature_dim: int) -> GraphIR:
         [0, 1],
         [1, 2]
     ], dtype=torch.long).t()
+    
+    # Assign random operation to COMPUTE node (node_id=1)
+    node_ops = {1: random.choice(OP_NAMES)}
 
-    return GraphIR(node_features, node_types, edge_index)
+    return GraphIR(node_features, node_types, edge_index, node_ops=node_ops)
 
 
 # =========================
@@ -399,6 +518,19 @@ def main():
 
     print("\nBest PyG Data:")
     print(pyg_data)
+    
+    # Execute the best graph
+    print("\n=== Graph Execution ===")
+    print(f"COMPUTE node operations: {best_ir.node_ops}")
+    
+    test_inputs = [1.0, 3.0, 5.0, 10.0]
+    print("\nExecution results:")
+    for inp in test_inputs:
+        try:
+            out = execute_graph(best_ir, inp)
+            print(f"  Input: {inp:5.1f} -> Output: {out:10.2f}")
+        except Exception as e:
+            print(f"  Input: {inp:5.1f} -> Error: {e}")
 
 
 if __name__ == "__main__":
