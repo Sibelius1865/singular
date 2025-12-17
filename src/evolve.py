@@ -1,6 +1,27 @@
 import random
 import numpy as np
 from graph_ir import GraphIR, Node, Edge, ATTR_DIM
+import torch
+from pyg_adapter import graphir_to_pyg
+from model import SimpleGNN
+
+
+_model = None
+
+
+def learning_fitness(g):
+    global _model
+
+    if _model is None:
+        _model = SimpleGNN(in_dim=len(g.nodes[0].attrs))
+
+    data = graphir_to_pyg(g)
+
+    pred = _model(data)
+    loss = pred.pow(2).mean()  # dummy target = 0
+
+    return -loss.item()
+
 
 MAX_NODES = 10
 
