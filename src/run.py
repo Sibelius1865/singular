@@ -5,6 +5,8 @@ from typing import List, Dict
 import torch
 from torch_geometric.data import Data
 
+from visualize import visualize_graph
+
 
 # =========================
 # Graph IR definition
@@ -169,6 +171,7 @@ def main():
     feature_dim = 8
     population_size = 10
 
+    # Initialize population
     population = [
         random_graph_ir(
             num_nodes=4,
@@ -178,14 +181,20 @@ def main():
         for _ in range(population_size)
     ]
 
+    # Run GA
     evolved = evolve(
         population,
         generations=10,
         feature_dim=feature_dim
     )
 
-    # Convert best individual to PyG Data
+    # Select best individual by fitness
     best_ir = max(evolved, key=fitness)
+
+    # Visualize best graph
+    visualize_graph(best_ir, title="Best Graph")
+
+    # Convert best individual to PyG Data
     pyg_data = ir_to_pyg(best_ir)
 
     print("\nBest PyG Data:")
