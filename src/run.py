@@ -1,6 +1,7 @@
 import random
 import copy
-from typing import List, Dict
+import ast
+from typing import List, Dict, Callable
 
 import torch
 from torch_geometric.data import Data
@@ -164,6 +165,224 @@ def execute_graph(ir: GraphIR, input_value: float) -> float:
         )
     
     return env[output_nodes[0]]
+
+
+# =========================
+# GraphIR → Python AST conversion
+# =========================
+
+def graph_to_ast(graph: GraphIR) -> ast.Module:
+    """
+    Convert GraphIR to Python AST.
+    
+    Generates a function of the form:
+    def generated_fn(x):
+        n0 = x
+        n1 = OPS["mul2"](n0)
+        n2 = OPS["add1"](n1)
+        return n2
+    
+    Args:
+        graph: GraphIR to convert
+    
+    Returns:
+        ast.Module containing the function definition
+    """
+    g = _ir_to_nx(graph)
+    
+    # Get topological order
+    try:
+        order = list(nx.topological_sort(g))
+    except nx.NetworkXError:
+        raise ValueError("Graph contains cycles, cannot convert to AST")
+    
+    # Find INPUT and OUTPUT nodes
+    input_nodes = [
+        n for n in range(graph.num_nodes)
+        if graph.node_types[n].item() == NodeType.INPUT
+    ]
+    output_nodes = [
+        n for n in range(graph.num_nodes)
+        if graph.node_types[n].item() == NodeType.OUTPUT
+    ]
+    
+    if len(input_nodes) != 1:
+        raise ValueError(f"Graph must have exactly one INPUT node (got {len(input_nodes)})")
+    if len(output_nodes) != 1:
+        raise ValueError(f"Graph must have exactly one OUTPUT node (got {len(output_nodes)})")
+    
+    input_node = input_nodes[0]
+    output_node = output_nodes[0]
+    
+    # Build function body statements
+    body = []
+    
+    # Process nodes in topological order
+    for node in order:
+        ntype = graph.node_types[node].item()
+        
+        if ntype == NodeType.INPUT:
+            # INPUT node: bind to function argument x
+            # n{node} = x
+            body.append(
+                ast.Assign(
+                    targets=[ast.Name(id=f"n{node}", ctx=ast.Store())],
+                    value=ast.Name(id="x", ctx=ast.Load())
+                )
+            )
+        
+        elif ntype == NodeType.COMPUTE:
+            # COMPUTE node: apply operation to predecessor
+            preds = list(g.predecessors(node))
+            if len(preds) == 0:
+                raise ValueError(f"COMPUTE node {node} has no inputs")
+            
+            # Use first predecessor (same logic as execute_graph)
+            pred_node = preds[0]
+            pred_var = ast.Name(id=f"n{pred_node}", ctx=ast.Load())
+            
+            if node not in graph.node_ops:
+                raise ValueError(f"COMPUTE node {node} has no operation assigned")
+            
+            op_name = graph.node_ops[node]
+            
+            # Build: n{node} = OPS["op_name"](n{pred_node})
+            body.append(
+                ast.Assign(
+                    targets=[ast.Name(id=f"n{node}", ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Subscript(
+                            value=ast.Name(id="OPS", ctx=ast.Load()),
+                            slice=ast.Constant(value=op_name),
+                            ctx=ast.Load()
+                        ),
+                        args=[pred_var],
+                        keywords=[]
+                    )
+                )
+            )
+        
+        elif ntype == NodeType.OUTPUT:
+            # OUTPUT node: return predecessor value
+            preds = list(g.predecessors(node))
+            if len(preds) == 0:
+                raise ValueError(f"OUTPUT node {node} has no inputs")
+            
+            # Use first predecessor (same logic as execute_graph)
+            pred_node = preds[0]
+            pred_var = ast.Name(id=f"n{pred_node}", ctx=ast.Load())
+            
+            # Build: return n{pred_node}
+            body.append(ast.Return(value=pred_var))
+    
+    # Create function definition
+    func_def = ast.FunctionDef(
+        name="generated_fn",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg="x", annotation=None)],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[]
+        ),
+        body=body,
+        decorator_list=[],
+        returns=None
+    )
+    
+    # Create module
+    module = ast.Module(body=[func_def], type_ignores=[])
+    
+    # Fix missing locations (required for compilation)
+    ast.fix_missing_locations(module)
+    
+    return module
+
+
+def compile_graph(graph: GraphIR) -> Callable:
+    """
+    Compile GraphIR to a callable Python function.
+    
+    Args:
+        graph: GraphIR to compile
+    
+    Returns:
+        Callable function that takes input_value and returns output
+    """
+    ast_module = graph_to_ast(graph)
+    
+    # Compile AST to code object
+    code = compile(ast_module, filename="<generated>", mode="exec")
+    
+    # Execute in a namespace that includes OPS
+    namespace = {"OPS": OPS}
+    exec(code, namespace)
+    
+    # Extract the generated function
+    if "generated_fn" not in namespace:
+        raise RuntimeError("Failed to generate function from AST")
+    
+    return namespace["generated_fn"]
+
+
+def ast_to_source(ast_module: ast.Module) -> str:
+    """
+    Convert AST module to Python source code string.
+    
+    Args:
+        ast_module: AST module to convert
+    
+    Returns:
+        Python source code as string
+    """
+    try:
+        # Python 3.9+ has ast.unparse
+        if hasattr(ast, 'unparse'):
+            return ast.unparse(ast_module)
+        else:
+            # Fallback for older Python versions
+            # Use astor or manual string building
+            # For now, raise informative error
+            raise NotImplementedError(
+                "ast.unparse is not available (Python < 3.9). "
+                "Please use Python 3.9+ or install astor package."
+            )
+    except AttributeError:
+        raise NotImplementedError(
+            "ast.unparse is not available. Please use Python 3.9+."
+        )
+
+
+def save_graph_as_function(graph: GraphIR, filepath: str, function_name: str = "generated_fn"):
+    """
+    Save GraphIR as a Python function to a file.
+    
+    Args:
+        graph: GraphIR to save
+        filepath: Path to save the Python file
+        function_name: Name for the generated function
+    """
+    ast_module = graph_to_ast(graph)
+    
+    # Rename function if needed
+    if function_name != "generated_fn":
+        for node in ast.walk(ast_module):
+            if isinstance(node, ast.FunctionDef) and node.name == "generated_fn":
+                node.name = function_name
+    
+    source = ast_to_source(ast_module)
+    
+    # Add OPS import at the top
+    full_source = f"""# Auto-generated from GraphIR
+# This file was generated automatically. Do not edit manually.
+
+from run import OPS
+
+{source}
+"""
+    
+    with open(filepath, 'w') as f:
+        f.write(full_source)
 
 
 # =========================
@@ -531,6 +750,34 @@ def main():
             print(f"  Input: {inp:5.1f} -> Output: {out:10.2f}")
         except Exception as e:
             print(f"  Input: {inp:5.1f} -> Error: {e}")
+    
+    # Compile to Python function
+    print("\n=== AST Compilation ===")
+    try:
+        compiled_fn = compile_graph(best_ir)
+        print("✓ Graph compiled to Python function")
+        
+        # Verify equivalence
+        print("\nVerification (execute_graph vs compiled function):")
+        for inp in test_inputs:
+            try:
+                out1 = execute_graph(best_ir, inp)
+                out2 = compiled_fn(inp)
+                match = abs(out1 - out2) < 1e-10
+                print(f"  Input: {inp:5.1f} -> execute_graph={out1:10.2f}, "
+                      f"compiled_fn={out2:10.2f}, match={match}")
+            except Exception as e:
+                print(f"  Input: {inp:5.1f} -> Error: {e}")
+        
+        # Try to generate source code (Python 3.9+)
+        try:
+            source = ast_to_source(graph_to_ast(best_ir))
+            print(f"\n✓ Generated Python source code ({len(source)} chars):")
+            print(source[:500] + "..." if len(source) > 500 else source)
+        except NotImplementedError as e:
+            print(f"\nNote: Source code generation not available ({e})")
+    except Exception as e:
+        print(f"✗ AST compilation failed: {e}")
 
 
 if __name__ == "__main__":
