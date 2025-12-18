@@ -1,7 +1,9 @@
 import random
 import copy
 import ast
-from typing import List, Dict, Callable
+from typing import List, Dict, Callable, Optional
+from datetime import datetime
+import os
 
 import torch
 from torch_geometric.data import Data
@@ -632,6 +634,71 @@ def semantic_mutate(ir: GraphIR, feature_dim: int) -> GraphIR:
 
 
 # =========================
+# Logging utilities
+# =========================
+
+_log_file: Optional[object] = None
+
+
+def setup_logging(log_dir: str = "logs") -> str:
+    """
+    Setup logging to a file with timestamp.
+    
+    Args:
+        log_dir: Directory to save log files
+    
+    Returns:
+        Path to the log file
+    """
+    global _log_file
+    
+    # Create log directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create log file with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"run_{timestamp}.log")
+    
+    _log_file = open(log_path, 'w', encoding='utf-8')
+    
+    # Write header
+    _log_file.write(f"=== Graph IR Evolution Run ===\n")
+    _log_file.write(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    _log_file.write(f"{'='*50}\n\n")
+    
+    return log_path
+
+
+def log_write(message: str, also_print: bool = True):
+    """
+    Write message to log file and optionally print to console.
+    
+    Args:
+        message: Message to write
+        also_print: Whether to also print to console
+    """
+    global _log_file
+    
+    if also_print:
+        print(message)
+    
+    if _log_file is not None:
+        _log_file.write(message + '\n')
+        _log_file.flush()  # Ensure immediate write
+
+
+def close_logging():
+    """Close the log file."""
+    global _log_file
+    
+    if _log_file is not None:
+        _log_file.write(f"\n{'='*50}\n")
+        _log_file.write(f"Ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        _log_file.close()
+        _log_file = None
+
+
+# =========================
 # Genetic Algorithm loop
 # =========================
 
@@ -650,12 +717,14 @@ def evolve(
 
         best_ir = scored[0][1]
         paths = semantic_paths(best_ir)
-        print(
+        
+        log_message = (
             f"Gen {gen}: best fitness = {scored[0][0]:.2f}, "
             f"nodes = {best_ir.num_nodes}, "
             f"edges = {best_ir.edge_index.size(1)}, "
             f"semantic_paths = {len(paths)}"
         )
+        log_write(log_message)
 
         # Reproduce
         new_population = elites.copy()
@@ -701,83 +770,136 @@ def initial_graph(feature_dim: int) -> GraphIR:
 # =========================
 
 def main():
-    random.seed(0)
-    torch.manual_seed(0)
-
-    feature_dim = 8
-    population_size = 10
-
-    # Initialize population
-    population = [
-        initial_graph(feature_dim)
-        for _ in range(population_size)
-    ]
-
-    # Run GA
-    evolved = evolve(
-        population,
-        generations=10,
-        feature_dim=feature_dim
-    )
-
-    # Select best individual by fitness
-    best_ir = max(evolved, key=fitness)
-    best_fitness = fitness(best_ir)
-
-    # Visualize best graph with fitness and path information
-    visualize_graph(
-        best_ir,
-        title="Best Graph (Semantic Evolution)",
-        fitness_value=best_fitness,
-        show_paths=True
-    )
-
-    # Convert best individual to PyG Data
-    pyg_data = ir_to_pyg(best_ir)
-
-    print("\nBest PyG Data:")
-    print(pyg_data)
+    # Setup logging
+    log_path = setup_logging()
+    log_write(f"Log file: {log_path}")
+    log_write(f"Random seed: 0")
+    log_write(f"Torch seed: 0")
     
-    # Execute the best graph
-    print("\n=== Graph Execution ===")
-    print(f"COMPUTE node operations: {best_ir.node_ops}")
-    
-    test_inputs = [1.0, 3.0, 5.0, 10.0]
-    print("\nExecution results:")
-    for inp in test_inputs:
-        try:
-            out = execute_graph(best_ir, inp)
-            print(f"  Input: {inp:5.1f} -> Output: {out:10.2f}")
-        except Exception as e:
-            print(f"  Input: {inp:5.1f} -> Error: {e}")
-    
-    # Compile to Python function
-    print("\n=== AST Compilation ===")
     try:
-        compiled_fn = compile_graph(best_ir)
-        print("✓ Graph compiled to Python function")
+        random.seed(0)
+        torch.manual_seed(0)
+
+        feature_dim = 8
+        population_size = 10
+
+        log_write(f"\n=== Configuration ===")
+        log_write(f"Feature dimension: {feature_dim}")
+        log_write(f"Population size: {population_size}")
+        log_write(f"Generations: 10")
+
+        # Initialize population
+        log_write(f"\n=== Initialization ===")
+        population = [
+            initial_graph(feature_dim)
+            for _ in range(population_size)
+        ]
+        log_write(f"Initialized population of {len(population)} graphs")
+
+        # Run GA
+        log_write(f"\n=== Evolution ===")
+        evolved = evolve(
+            population,
+            generations=10,
+            feature_dim=feature_dim
+        )
+
+        # Select best individual by fitness
+        best_ir = max(evolved, key=fitness)
+        best_fitness = fitness(best_ir)
+
+        log_write(f"\n=== Best Individual ===")
+        log_write(f"Best fitness: {best_fitness:.4f}")
+        log_write(f"Number of nodes: {best_ir.num_nodes}")
+        log_write(f"Number of edges: {best_ir.edge_index.size(1)}")
+        log_write(f"COMPUTE node operations: {best_ir.node_ops}")
         
-        # Verify equivalence
-        print("\nVerification (execute_graph vs compiled function):")
+        paths = semantic_paths(best_ir)
+        log_write(f"Semantic paths: {len(paths)}")
+        if paths:
+            log_write(f"Sample paths (first 3):")
+            for i, path in enumerate(paths[:3]):
+                log_write(f"  Path {i+1}: {path}")
+
+        # Visualize best graph with fitness and path information
+        visualize_graph(
+            best_ir,
+            title="Best Graph (Semantic Evolution)",
+            fitness_value=best_fitness,
+            show_paths=True
+        )
+
+        # Convert best individual to PyG Data
+        pyg_data = ir_to_pyg(best_ir)
+
+        log_write(f"\n=== PyG Data ===")
+        log_write(str(pyg_data), also_print=False)
+        
+        # Execute the best graph
+        log_write(f"\n=== Graph Execution ===")
+        log_write(f"COMPUTE node operations: {best_ir.node_ops}")
+        
+        test_inputs = [1.0, 3.0, 5.0, 10.0]
+        log_write(f"\nExecution results:")
+        execution_results = []
         for inp in test_inputs:
             try:
-                out1 = execute_graph(best_ir, inp)
-                out2 = compiled_fn(inp)
-                match = abs(out1 - out2) < 1e-10
-                print(f"  Input: {inp:5.1f} -> execute_graph={out1:10.2f}, "
-                      f"compiled_fn={out2:10.2f}, match={match}")
+                out = execute_graph(best_ir, inp)
+                result_msg = f"  Input: {inp:5.1f} -> Output: {out:10.2f}"
+                log_write(result_msg)
+                execution_results.append((inp, out, None))
             except Exception as e:
-                print(f"  Input: {inp:5.1f} -> Error: {e}")
+                result_msg = f"  Input: {inp:5.1f} -> Error: {e}"
+                log_write(result_msg)
+                execution_results.append((inp, None, str(e)))
         
-        # Try to generate source code (Python 3.9+)
+        # Compile to Python function
+        log_write(f"\n=== AST Compilation ===")
         try:
-            source = ast_to_source(graph_to_ast(best_ir))
-            print(f"\n✓ Generated Python source code ({len(source)} chars):")
-            print(source[:500] + "..." if len(source) > 500 else source)
-        except NotImplementedError as e:
-            print(f"\nNote: Source code generation not available ({e})")
-    except Exception as e:
-        print(f"✗ AST compilation failed: {e}")
+            compiled_fn = compile_graph(best_ir)
+            log_write("✓ Graph compiled to Python function")
+            
+            # Verify equivalence
+            log_write(f"\nVerification (execute_graph vs compiled function):")
+            verification_results = []
+            for inp in test_inputs:
+                try:
+                    out1 = execute_graph(best_ir, inp)
+                    out2 = compiled_fn(inp)
+                    match = abs(out1 - out2) < 1e-10
+                    result_msg = (
+                        f"  Input: {inp:5.1f} -> execute_graph={out1:10.2f}, "
+                        f"compiled_fn={out2:10.2f}, match={match}"
+                    )
+                    log_write(result_msg)
+                    verification_results.append((inp, out1, out2, match))
+                except Exception as e:
+                    result_msg = f"  Input: {inp:5.1f} -> Error: {e}"
+                    log_write(result_msg)
+                    verification_results.append((inp, None, None, False))
+            
+            # Try to generate source code (Python 3.9+)
+            try:
+                source = ast_to_source(graph_to_ast(best_ir))
+                log_write(f"\n✓ Generated Python source code ({len(source)} chars):")
+                log_write("=" * 50)
+                log_write(source, also_print=False)
+                log_write("=" * 50)
+            except NotImplementedError as e:
+                log_write(f"\nNote: Source code generation not available ({e})")
+        except Exception as e:
+            log_write(f"✗ AST compilation failed: {e}")
+        
+        log_write(f"\n=== Summary ===")
+        log_write(f"Best fitness achieved: {best_fitness:.4f}")
+        log_write(f"Best graph structure: {best_ir.num_nodes} nodes, {best_ir.edge_index.size(1)} edges")
+        log_write(f"Total semantic paths: {len(paths)}")
+        log_write(f"Successful executions: {sum(1 for _, out, err in execution_results if err is None)}/{len(execution_results)}")
+        
+    finally:
+        # Always close logging
+        close_logging()
+        print(f"\nLog saved to: {log_path}")
 
 
 if __name__ == "__main__":
